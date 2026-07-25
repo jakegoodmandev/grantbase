@@ -6,5 +6,9 @@ create table foundations (
   contact_email text,
   contact_phone text,
   created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now()
+  updated_at    timestamptz not null default now(),
+  -- ingestion/freshness metadata (section 5); upserts key on the unique name
+  source              text,
+  source_external_id  text,
+  last_seen_at        timestamptz
 );

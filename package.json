@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "format": "biome format --write ."
+    "format": "biome format --write .",
+    "ingest": "bun run scripts/ingest/run.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",

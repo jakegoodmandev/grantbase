@@ -9,6 +9,7 @@
     "ignoreUnknown": false,
     "includes": [
       "src/**",
+      "scripts/**",
       "!src/components/ui",
       "!**/*.d.ts",
       "!public",
