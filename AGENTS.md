@@ -71,7 +71,7 @@ local-only prototype (no deploy yet).
   `schemas/12_grants.sql`). Symptom of a missing grant: `permission denied for table X`.
 - The diff tool does **not** capture `alter policy`, column privileges, comments, or DML
   (seed data). Seed is `supabase/seed.sql` (currently empty — data comes from ingestion).
-- **Multi-tenancy model:** shared catalog (`foundations`/`grants`/`past_awards`) is
+- **Multi-tenancy model:** shared catalog (`foundations`/`programs`/`grants`/`awards`/`disclosures`) is
   world-readable, written only via the secret key. Tenant-private
   (`applicants`/`applications`/`saved_grants`) carries `owner_id = auth.uid()`; RLS makes
   rows invisible across tenants.

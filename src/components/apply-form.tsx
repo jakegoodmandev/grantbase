@@ -10,14 +10,22 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-type Applicant = { id: string; display_name: string; type: string };
+type Applicant = {
+  id: string;
+  display_name: string;
+  type: string;
+  is_self?: boolean;
+};
+type Application = { id: string; status: string; applicant_id: string };
 
 export function ApplyForm({
   grantId,
   applicants,
+  applications,
 }: {
   grantId: string;
   applicants: Applicant[];
+  applications?: Application[];
 }) {
   const [applicantId, setApplicantId] = useState(applicants[0]?.id ?? "");
   if (!applicants.length)
@@ -27,8 +35,13 @@ export function ApplyForm({
       </p>
     );
 
+  const existingByApplicant = new Map(
+    (applications ?? []).map((app) => [app.applicant_id, app]),
+  );
+  const selectedExisting = existingByApplicant.get(applicantId);
+
   return (
-    <form action={applyToGrant} className="flex gap-2">
+    <form action={applyToGrant} className="flex gap-2 items-center">
       <input type="hidden" name="grantId" value={grantId} />
       <input type="hidden" name="applicantId" value={applicantId} />
       <Select
@@ -41,12 +54,15 @@ export function ApplyForm({
         <SelectContent>
           {applicants.map((a) => (
             <SelectItem key={a.id} value={a.id}>
-              {a.display_name} ({a.type})
+              {a.display_name} ({a.type}){a.is_self ? " — self" : ""}
+              {existingByApplicant.has(a.id) ? " (applied)" : ""}
             </SelectItem>
           ))}
         </SelectContent>
       </Select>
-      <Button type="submit">Apply</Button>
+      <Button type="submit" disabled={!!selectedExisting}>
+        {selectedExisting ? "Applied" : "Apply"}
+      </Button>
     </form>
   );
 }

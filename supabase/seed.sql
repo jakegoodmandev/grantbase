@@ -1,7 +1,8 @@
 -- Seed data intentionally left empty.
 --
--- The catalog (foundations / grants / past_awards) is now populated from real
--- Canadian data by the ingestion pipeline (section 5), not from mock rows:
+-- The catalog (foundations / programs / grants / awards / disclosures) is now
+-- populated from real Canadian data by the ingestion pipeline (section 5), not
+-- from mock rows:
 --   bun run ingest --source=canadian-heritage
 --   bun run ingest --source=canada-council
 --

@@ -85,18 +85,22 @@ Split the DDL below across these files (the single block that follows is just th
 | `02_enums.sql` | the four enum types |
 | `03_functions.sql` | `set_updated_at()` |
 | `04_foundations.sql` | `foundations` + indexes |
-| `05_grants.sql` | `grants` + indexes (FK → foundations) |
-| `06_past_awards.sql` | `past_awards` + index (FK → grants) |
+| `05_programs.sql` | `programs` + indexes (FK → foundations) |
+| `06_grants.sql` | `grants` + indexes (FK → foundations, programs) |
 | `07_applicants.sql` | `applicants` + index |
 | `08_applications.sql` | `applications` + indexes (FK → applicants, grants) |
 | `09_saved_grants.sql` | `saved_grants` + index |
-| `10_triggers.sql` | the `updated_at` triggers |
-| `11_rls.sql` | `enable row level security` + `create policy` statements |
+| `10_awards.sql` | `awards` + index (FK → grants) |
+| `11_disclosures.sql` | `disclosures` + indexes (FK → awards) |
+| `12_triggers.sql` | the `updated_at` triggers |
+| `13_rls.sql` | `enable row level security` + `create policy` statements |
+| `14_grants.sql` | table-level privileges for catalog + tenant tables |
+| `15_ingestion.sql` | `raw_ingest` + `sync_runs` staging/observability tables |
 
 **Caveat that matters here:** the diff tool captures `create policy` fine, but **not** `alter policy`, column privileges, or comments. If you later need to *alter* a policy, do it as a hand-written versioned migration rather than editing the schema file. (Seed data is DML — also not captured — see §3.)
 
 **Multi-tenancy model:**
-- **Shared catalog** (`foundations`, `grants`, `past_awards`): RLS on, `select` open to everyone, writes only via the secret key (which bypasses RLS — that's your ingestion pipeline's key).
+- **Shared catalog** (`foundations`, `programs`, `grants`, `awards`, `disclosures`): RLS on, `select` open to everyone, writes only via the secret key (which bypasses RLS — that's your ingestion pipeline's key).
 - **Tenant-private** (`applicants`, `applications`, `saved_grants`): every row carries `owner_id = auth.uid()`, and RLS makes rows invisible across tenants. A user never sees another user's clients or applications.
 - **"Apply on behalf of self or a client"**: a `User` (auth account) owns many `applicants`. One is flagged `is_self`; the rest are clients. Applications link an *applicant* to a *grant*, so the same account can apply as itself or for any client it manages.
 
@@ -122,46 +126,88 @@ create table foundations (
   website       text,
   contact_email text,
   contact_phone text,
+  source        text,
+  source_external_id text,
+  last_seen_at  timestamptz,
   created_at    timestamptz not null default now(),
   updated_at    timestamptz not null default now()
 );
 
+create table programs (
+  id                  uuid primary key default gen_random_uuid(),
+  foundation_id       uuid not null references foundations(id) on delete cascade,
+  title               text not null,
+  description         text,
+  source              text,
+  source_external_id  text,
+  last_seen_at        timestamptz,
+  created_at          timestamptz not null default now(),
+  updated_at          timestamptz not null default now(),
+  unique (foundation_id, title),
+  unique (source, source_external_id)
+);
+create index programs_foundation_idx on programs (foundation_id);
+create index programs_source_idx     on programs (source, source_external_id);
+
 create table grants (
   id                  uuid primary key default gen_random_uuid(),
   foundation_id       uuid not null references foundations(id) on delete cascade,
-  title               text not null unique,
+  program_id          uuid not null references programs(id) on delete cascade,
+  title               text not null,
   description         text,
   award_min           numeric(12,2),
   award_max           numeric(12,2),
   eligibility         eligibility_type not null default 'both',
   application_deadline date,
   status              grant_status not null default 'open',
-  -- ingestion/freshness metadata (used in section 5)
-  source              text,          -- e.g. 'grants.gov', 'propublica', 'manual'
-  source_external_id  text,          -- id in the source system, for upserts
+  source              text,
+  source_external_id  text,
   last_seen_at        timestamptz,
   created_at          timestamptz not null default now(),
   updated_at          timestamptz not null default now(),
   constraint amount_range_valid
     check (award_max is null or award_min is null or award_max >= award_min),
+  unique (program_id, title),
   unique (source, source_external_id)
 );
 create index grants_foundation_idx  on grants (foundation_id);
+create index grants_program_idx     on grants (program_id);
 create index grants_status_idx      on grants (status);
 create index grants_eligibility_idx on grants (eligibility);
 create index grants_deadline_idx    on grants (application_deadline);
 
-create table past_awards (
-  id           uuid primary key default gen_random_uuid(),
-  grant_id     uuid not null references grants(id) on delete cascade,
-  winner_name  text not null,
-  winner_type  applicant_type not null,
-  award_date   date,
-  award_amount numeric(12,2),
-  notes        text,
-  created_at   timestamptz not null default now()
+create table awards (
+  id                  uuid primary key default gen_random_uuid(),
+  grant_id            uuid not null references grants(id) on delete cascade,
+  winner_name         text not null,
+  winner_type         applicant_type not null,
+  award_date          date,
+  award_amount        numeric(12,2),
+  notes               text,
+  source              text,
+  source_external_id  text,
+  last_seen_at        timestamptz,
+  created_at          timestamptz not null default now(),
+  updated_at          timestamptz not null default now(),
+  unique (source, source_external_id)
 );
-create index past_awards_grant_idx on past_awards (grant_id);
+create index awards_grant_idx on awards (grant_id);
+
+create table disclosures (
+  id                  uuid primary key default gen_random_uuid(),
+  award_id            uuid not null references awards(id) on delete cascade,
+  period              text,
+  amount              numeric(12,2),
+  payload             jsonb not null,
+  source              text,
+  source_external_id  text,
+  last_seen_at        timestamptz,
+  created_at          timestamptz not null default now(),
+  updated_at          timestamptz not null default now(),
+  unique (source, source_external_id)
+);
+create index disclosures_award_idx  on disclosures (award_id);
+create index disclosures_source_idx  on disclosures (source, source_external_id);
 
 -- ================= TENANT-PRIVATE =================
 create table applicants (
@@ -204,22 +250,29 @@ create index saved_grants_owner_idx on saved_grants (owner_id);
 
 -- updated_at triggers
 create trigger t_foundations_upd  before update on foundations  for each row execute function set_updated_at();
-create trigger t_grants_upd       before update on grants       for each row execute function set_updated_at();
+create trigger t_programs_upd    before update on programs    for each row execute function set_updated_at();
+create trigger t_grants_upd      before update on grants      for each row execute function set_updated_at();
+create trigger t_awards_upd      before update on awards      for each row execute function set_updated_at();
+create trigger t_disclosures_upd before update on disclosures for each row execute function set_updated_at();
 create trigger t_applicants_upd   before update on applicants   for each row execute function set_updated_at();
 create trigger t_applications_upd before update on applications for each row execute function set_updated_at();
 
 -- ================= ROW-LEVEL SECURITY =================
 alter table foundations  enable row level security;
+alter table programs     enable row level security;
 alter table grants       enable row level security;
-alter table past_awards  enable row level security;
+alter table awards       enable row level security;
+alter table disclosures  enable row level security;
 alter table applicants   enable row level security;
 alter table applications enable row level security;
 alter table saved_grants enable row level security;
 
 -- Catalog: world-readable, writes only via the secret key (which bypasses RLS)
-create policy catalog_read_foundations on foundations for select using (true);
-create policy catalog_read_grants      on grants      for select using (true);
-create policy catalog_read_awards      on past_awards for select using (true);
+create policy catalog_read_foundations on foundations  for select using (true);
+create policy catalog_read_programs    on programs     for select using (true);
+create policy catalog_read_grants      on grants       for select using (true);
+create policy catalog_read_awards      on awards       for select using (true);
+create policy catalog_read_disclosures on disclosures  for select using (true);
 
 -- Tenant data: you only ever touch your own rows
 create policy own_applicants on applicants
@@ -230,7 +283,9 @@ create policy own_saved on saved_grants
   for all using (auth.uid() = owner_id) with check (auth.uid() = owner_id);
 ```
 
-**Why `past_awards` denormalizes the winner** rather than FK-ing to `applicants`: historical winners are public-record facts, not platform users. Coupling them to tenant accounts would be wrong and would leak across tenants. Keep them as flat catalog data.
+**Why `awards` denormalizes the winner** rather than FK-ing to `applicants`: historical winners are public-record facts, not platform users. Coupling them to tenant accounts would be wrong and would leak across tenants. Keep them as flat catalog data.
+
+**Why `disclosures` is a separate table from `raw_ingest`:** `raw_ingest` is a generic, source-agnostic staging dump for the extract phase. `disclosures` is the domain table for Canadian Heritage's quarterly transaction records, with a proper foreign key to `awards` so the catalog can answer "what raw records make up this award?" without scanning untyped JSONB.
 
 **Generate the migration from the declared schema** (never write the migration by hand):
 
@@ -246,67 +301,25 @@ Review the generated migration before committing. On later schema changes, edit 
 
 ## 3. Mock data population
 
-Seed data is **DML** (`insert`s), which the schema-diff tool does **not** capture — so it lives in `supabase/seed.sql`, never in `supabase/schemas/`. `supabase db reset` applies the generated migrations and then runs `seed.sql`. It uses `current_date` offsets so "open" grants always have live deadlines and "closed" ones sit in the past — no date maintenance. References use name/title subqueries so it stays readable and order-independent within each block.
+`supabase/seed.sql` is currently **empty** — the catalog is populated by the ingestion pipeline from real Canadian data (see §5). Seed data is **DML** (`insert`s), which the schema-diff tool does **not** capture, so it lives in `supabase/seed.sql`, never in `supabase/schemas/`. `bunx supabase db reset` applies the generated migrations and then runs `seed.sql`.
+
+A previous fictional seed (5 foundations, 19 grants, 26 awards) is preserved in git history for reference. If you restore it, update it to the new schema:
 
 ```sql
--- ---------- Foundations (5) ----------
-insert into foundations (name, description, website, contact_email, contact_phone) values
-('Cedar Valley Community Foundation', 'Regional foundation funding neighborhood, small-business, and emergency-relief projects across the Cedar Valley area.', 'https://cedarvalleycf.org',   'grants@cedarvalleycf.org',   '555-0142'),
-('The Hartwell Arts Trust',           'Endowed trust supporting individual artists and arts organizations through fellowships, commissions, and operating grants.', 'https://hartwellarts.org',    'apply@hartwellarts.org',     '555-0198'),
-('Meridian Health Foundation',        'Health-focused funder backing community clinics, health innovation, and healthcare workforce scholarships.', 'https://meridianhealthfdn.org','info@meridianhealthfdn.org', '555-0173'),
-('GreenFuture Environmental Fund',    'Environmental grantmaker funding urban greening, watershed restoration, and sustainable agriculture.', 'https://greenfuturefund.org', 'grants@greenfuturefund.org', '555-0121'),
-('TechForward Education Initiative',  'Education funder advancing STEM access, EdTech pilots, and scholarships for first-generation students.', 'https://techforward.org',     'hello@techforward.org',      '555-0160');
+-- programs (one per grant group)
+insert into programs (foundation_id, title, description, source, source_external_id)
+values ((select id from foundations where name='...'), 'Program Name', '...', 'manual', 'program-slug');
 
--- ---------- Grants (19: mixed status & eligibility) ----------
-insert into grants (foundation_id, title, description, award_min, award_max, eligibility, application_deadline, status, source) values
-((select id from foundations where name='Cedar Valley Community Foundation'), 'Neighborhood Small Grants Program',       'Micro-grants for grassroots neighborhood improvement projects.',                 500,     5000,   'both',         current_date + 45, 'open',    'manual'),
-((select id from foundations where name='Cedar Valley Community Foundation'), 'Local Entrepreneur Microgrant',           'Startup capital for individual local entrepreneurs.',                            1000,    10000,  'individual',   current_date + 90, 'open',    'manual'),
-((select id from foundations where name='Cedar Valley Community Foundation'), 'Community Facilities Improvement Fund',   'Capital improvements for community centers and shared facilities.',              10000,   75000,  'organization', current_date - 20, 'closed',  'manual'),
-((select id from foundations where name='Cedar Valley Community Foundation'), 'Emergency Relief Fund',                   'Rapid-response relief for individuals and small orgs facing crises.',            250,     2500,   'both',         null,              'rolling', 'manual'),
-((select id from foundations where name='The Hartwell Arts Trust'),           'Emerging Artist Fellowship',              'Unrestricted fellowship for early-career individual artists.',                   5000,    25000,  'individual',   current_date + 60, 'open',    'manual'),
-((select id from foundations where name='The Hartwell Arts Trust'),           'Arts Organization Operating Grant',       'General operating support for established arts nonprofits.',                     20000,   150000, 'organization', current_date - 10, 'closed',  'manual'),
-((select id from foundations where name='The Hartwell Arts Trust'),           'Public Mural Commission',                 'Commissions for public murals by individual artists or collectives.',            3000,    15000,  'both',         current_date + 30, 'open',    'manual'),
-((select id from foundations where name='The Hartwell Arts Trust'),           'Performing Arts Touring Grant',           'Travel and production support for touring performing-arts organizations.',       8000,    40000,  'organization', null,              'rolling', 'manual'),
-((select id from foundations where name='Meridian Health Foundation'),        'Community Health Innovation Award',       'Funds novel community-health delivery models.',                                  25000,   200000, 'organization', current_date + 75, 'open',    'manual'),
-((select id from foundations where name='Meridian Health Foundation'),        'Nursing Scholarship Fund',                'Tuition support for individuals pursuing nursing credentials.',                  2000,    12000,  'individual',   current_date + 120,'open',    'manual'),
-((select id from foundations where name='Meridian Health Foundation'),        'Rural Clinic Equipment Grant',            'Medical equipment funding for rural clinics.',                                   15000,   100000, 'organization', current_date - 30, 'closed',  'manual'),
-((select id from foundations where name='Meridian Health Foundation'),        'Mental Health Access Grant',              'Expands mental-health services for underserved populations.',                    10000,   60000,  'both',         current_date + 50, 'open',    'manual'),
-((select id from foundations where name='GreenFuture Environmental Fund'),    'Urban Greening Grant',                    'Tree-planting, pocket parks, and green infrastructure projects.',                5000,    50000,  'organization', current_date + 40, 'open',    'manual'),
-((select id from foundations where name='GreenFuture Environmental Fund'),    'Youth Climate Action Grant',              'Seed funding for youth-led climate projects.',                                   1000,    8000,   'individual',   current_date + 25, 'open',    'manual'),
-((select id from foundations where name='GreenFuture Environmental Fund'),    'Watershed Restoration Fund',              'Large-scale watershed and wetland restoration.',                                 30000,   250000, 'organization', current_date - 45, 'closed',  'manual'),
-((select id from foundations where name='GreenFuture Environmental Fund'),    'Sustainable Farming Transition Grant',    'Supports farms transitioning to sustainable practices.',                         10000,   80000,  'both',         null,              'rolling', 'manual'),
-((select id from foundations where name='TechForward Education Initiative'),  'STEM Classroom Grant',                    'Equipment and curriculum funding for K-12 STEM classrooms.',                     2000,    20000,  'organization', current_date + 35, 'open',    'manual'),
-((select id from foundations where name='TechForward Education Initiative'),  'First-Gen Coding Scholarship',            'Bootcamp/degree scholarships for first-generation coding students.',             3000,    15000,  'individual',   current_date + 100,'open',    'manual'),
-((select id from foundations where name='TechForward Education Initiative'),  'EdTech Pilot Grant',                      'Pilot funding for classroom EdTech tools.',                                      25000,   120000, 'organization', current_date - 15, 'closed',  'manual');
+-- grants (one per opportunity, FK → programs)
+insert into grants (foundation_id, program_id, title, description, award_min, award_max,
+                    eligibility, application_deadline, status, source, source_external_id)
+values ((select id from foundations where name='...'),
+        (select id from programs where source_external_id='program-slug'),
+        'Grant Title', '...', 500, 5000, 'both', current_date + 45, 'open', 'manual', 'grant-slug');
 
--- ---------- Past awards (26) ----------
-insert into past_awards (grant_id, winner_name, winner_type, award_date, award_amount, notes) values
-((select id from grants where title='Community Facilities Improvement Fund'), 'Riverside Community Center',        'organization', current_date - 400, 62000,  'Renovated an aging gymnasium into a multi-use youth space; strong volunteer match.'),
-((select id from grants where title='Community Facilities Improvement Fund'), 'Eastside Neighborhood Alliance',    'organization', current_date - 760, 45000,  'Accessibility upgrades to a shared community kitchen.'),
-((select id from grants where title='Arts Organization Operating Grant'),     'Cedar Valley Repertory Theatre',    'organization', current_date - 380, 120000, 'Sustained programming through a difficult season; clear audience-growth metrics.'),
-((select id from grants where title='Arts Organization Operating Grant'),     'Hartwell Chamber Orchestra',        'organization', current_date - 740, 95000,  'Expanded free community concert series.'),
-((select id from grants where title='Emerging Artist Fellowship'),            'Maya Okonkwo',                      'individual',   current_date - 200, 20000,  'Mixed-media series on regional migration; exceptional portfolio.'),
-((select id from grants where title='Emerging Artist Fellowship'),            'Daniel Reyes',                      'individual',   current_date - 560, 18000,  'Documentary photography of vanishing farm towns.'),
-((select id from grants where title='Emerging Artist Fellowship'),            'Priya Nair',                        'individual',   current_date - 920, 22000,  'Sculptural installation using reclaimed materials.'),
-((select id from grants where title='Public Mural Commission'),               'The Collective Brush',              'organization', current_date - 150, 12000,  'Community-designed mural on the transit hub wall.'),
-((select id from grants where title='Public Mural Commission'),               'Tomas Vela',                        'individual',   current_date - 500, 9000,   'Solo mural celebrating local Indigenous history.'),
-((select id from grants where title='Performing Arts Touring Grant'),         'Northern Lights Dance Company',     'organization', current_date - 120, 32000,  'Six-city regional tour with education workshops.'),
-((select id from grants where title='Rural Clinic Equipment Grant'),          'Prairie Health Cooperative',        'organization', current_date - 300, 88000,  'Purchased portable diagnostic equipment for mobile clinics.'),
-((select id from grants where title='Rural Clinic Equipment Grant'),          'Valley Ridge Community Clinic',     'organization', current_date - 680, 72000,  'Upgraded lab and imaging capacity serving 4 rural counties.'),
-((select id from grants where title='Community Health Innovation Award'),     'OpenCare Telehealth Initiative',    'organization', current_date - 250, 175000, 'Telehealth model reduced no-show rates by 40%.'),
-((select id from grants where title='Nursing Scholarship Fund'),              'Aaliyah Bennett',                   'individual',   current_date - 180, 10000,  'Second-career RN candidate; strong community-service record.'),
-((select id from grants where title='Nursing Scholarship Fund'),              'Marcus Trent',                      'individual',   current_date - 540, 11000,  'Rural nursing commitment after graduation.'),
-((select id from grants where title='Mental Health Access Grant'),            'Bridges Counseling Network',        'organization', current_date - 220, 55000,  'Sliding-scale therapy expansion in underserved zip codes.'),
-((select id from grants where title='Urban Greening Grant'),                  'City Roots Coalition',              'organization', current_date - 160, 44000,  '14 pocket parks and 300 street trees in heat-island zones.'),
-((select id from grants where title='Watershed Restoration Fund'),            'Clearwater Restoration Trust',      'organization', current_date - 350, 220000, 'Restored 3 miles of degraded streambank; measurable water-quality gains.'),
-((select id from grants where title='Watershed Restoration Fund'),            'Meadowbrook Conservancy',           'organization', current_date - 700, 190000, 'Wetland reconstruction restored native waterfowl habitat.'),
-((select id from grants where title='Youth Climate Action Grant'),            'Sofia Alvarez',                     'individual',   current_date - 140, 7000,   'Student-led school solar-education program.'),
-((select id from grants where title='Youth Climate Action Grant'),            'Jordan Kim',                        'individual',   current_date - 480, 6500,   'Neighborhood composting network founded by a high-schooler.'),
-((select id from grants where title='Sustainable Farming Transition Grant'),  'Hollow Creek Farm',                 'organization', current_date - 130, 60000,  'Transitioned 80 acres to no-till regenerative practices.'),
-((select id from grants where title='EdTech Pilot Grant'),                    'Lincoln Unified School District',   'organization', current_date - 210, 95000,  'Adaptive-math pilot across 12 classrooms; gains in proficiency scores.'),
-((select id from grants where title='STEM Classroom Grant'),                  'Westbrook Middle School',           'organization', current_date - 190, 16000,  'Robotics lab serving 200 students.'),
-((select id from grants where title='First-Gen Coding Scholarship'),          'Elena Vasquez',                     'individual',   current_date - 170, 12000,  'First-gen student; completed full-stack bootcamp, now employed.'),
-((select id from grants where title='Local Entrepreneur Microgrant'),         'Corner Cup Coffee',                 'organization', current_date - 260, 8000,   'Micro-roastery expansion; created 3 local jobs.');
+-- awards (rename from past_awards)
+insert into awards (grant_id, winner_name, winner_type, award_date, award_amount, notes)
+values ((select id from grants where title='...'), 'Recipient', 'individual', current_date - 400, 62000, '...');
 ```
 
 Apply it (after the migration has been generated in §2):
@@ -516,7 +529,7 @@ export default async function GrantDetail({ params }: { params: Promise<{ id: st
     .eq('id', id).single()
 
   const { data: winners } = await supabase
-    .from('past_awards')
+    .from('awards')
     .select('winner_name, winner_type, award_date, award_amount, notes')
     .eq('grant_id', id)
     .order('award_date', { ascending: false })
@@ -626,7 +639,7 @@ Once the local loop is proven, source real data in this priority order — free/
 | Source | Coverage | Access |
 |---|---|---|
 | **Grants.gov Search2 API** | Federal grant opportunities | Free JSON API, no scraping needed |
-| **USAspending.gov API** | Historical federal *awards* → your `past_awards` | Free JSON API |
+| **USAspending.gov API** | Historical federal *awards* → your `awards` | Free JSON API |
 | **ProPublica Nonprofit Explorer API** | Foundation profiles + Form 990 financials → `foundations` | Free JSON API |
 | **Candid / Foundation Directory** | Deepest private-foundation grant data | Paid API (add once revenue justifies) |
 | **State/city grant portals** | Local grants | Mostly HTML; scrape selectively |
@@ -636,14 +649,15 @@ Once the local loop is proven, source real data in this priority order — free/
 
 **Ingestion pipeline architecture:**
 ```
-Source adapters ──► raw_ingest (staging, JSONB)  ──► normalize ──► upsert into grants/foundations
+Source adapters ──► raw_ingest (staging, JSONB)  ──► normalize ──► upsert into foundations/programs/grants/awards/disclosures
    (per source)         one row per fetched item        map fields    on (source, source_external_id)
 ```
 
 1. **Staging table** `raw_ingest(id, source, external_id, payload jsonb, fetched_at)` — land raw responses untouched so you can re-normalize without re-fetching.
 2. **One adapter per source** — a function that pulls from the API/page and writes to `raw_ingest`. Isolates source-specific quirks.
-3. **Normalizer** maps raw payloads to your schema and **upserts on `(source, source_external_id)`** — the unique constraint already on `grants`. Re-running never duplicates; it updates in place.
-4. **Writes use the secret key**, which bypasses RLS — that's exactly why the catalog write policies are locked down.
+3. **Normalizer** maps raw payloads to your schema and **upserts on `(source, source_external_id)`** — unique constraints on `programs`, `grants`, `awards`, and `disclosures`. Re-running never duplicates; it updates in place.
+4. **Domain-specific raw records** are also copied into typed tables: for Canadian Heritage, the quarterly source rows become `disclosures` linked to `awards`. This lets the catalog answer "what raw records make up this award?" without scanning JSONB.
+5. **Writes use the secret key**, which bypasses RLS — that's exactly why the catalog write policies are locked down.
 
 **Keeping data fresh:**
 - `last_seen_at` is stamped on every upsert. A grant not seen in the latest sync of its source is a candidate to auto-mark `closed` (a grant that vanishes from a portal usually closed).
